@@ -948,9 +948,9 @@ def main() -> int:
         help="Also write CSV files (default: JSON only)",
     )
     parser.add_argument(
-        "--summary",
+        "--no-summary",
         action="store_true",
-        help="After processing, combine all result files into licenses_summary.json (license -> package -> repos).",
+        help="Do not build licenses_summary.json after processing (summary is on by default).",
     )
     parser.add_argument(
         "--summary-only",
@@ -976,7 +976,7 @@ def main() -> int:
     try:
         if len(repos) == 1:
             process_repo(repos[0], output_dir, not write_csv)
-            if args.summary:
+            if not args.no_summary:
                 summary_data = build_license_summary(output_dir)
                 out_path = write_summary_file(summary_data, output_dir)
                 print(f"Wrote summary to {out_path}", file=sys.stderr)
@@ -1001,7 +1001,7 @@ def main() -> int:
             summary.append((repo, status, duration_sec, len(errors), errors))
         total_duration = time.perf_counter() - total_start
         _print_summary_table(summary, total_duration)
-        if args.summary:
+        if not args.no_summary:
             summary_data = build_license_summary(output_dir)
             out_path = write_summary_file(summary_data, output_dir)
             print(f"Wrote summary to {out_path}", file=sys.stderr)
