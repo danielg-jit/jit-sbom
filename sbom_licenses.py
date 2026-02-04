@@ -95,29 +95,130 @@ LICENSE_NORMALIZE: dict[str, str] = {
     "PSF": "PSF-2.0",
     "PSFL": "PSF-2.0",
     "OSI Approved :: Python Software Foundation License": "PSF-2.0",
-    # Unlicense
+    # Unlicense (merge UNLICENSED / Unlicense to same key)
     "Unlicense": "Unlicense",
+    "UNLICENSED": "Unlicense",
     "OSI Approved :: The Unlicense (Unlicense)": "Unlicense",
     # Other
     "0BSD": "0BSD",
     "UNKNOWN": "unknown",
-    "UNLICENSED": "UNLICENSED",
     "EPL-2.0": "EPL-2.0",
-    "Dual License": "Dual License",
+    "Dual License": "unknown",
+    "Universal Permissive License 1.0": "UPL-1.0",
+    "UPL-1.0": "UPL-1.0",
 }
 
 
 def normalize_license(license_key: str) -> str:
-    """Map common license string variants to a canonical key."""
+    """Map common license string variants to a canonical key.
+    Long license text from PyPI/registries (full license body) is normalized
+    via substring checks so e.g. all Apache 2.0 and BSD-3-Clause text merge.
+    """
     s = (license_key or "").strip()
     if not s:
         return "unknown"
     if s in LICENSE_NORMALIZE:
         return LICENSE_NORMALIZE[s]
-    # Long license text that is clearly MIT
+    s_lower = s.lower()
+    # "SEE LICENSE IN <file>" style (license in repo file, not a name)
+    if s_lower.startswith("see license in"):
+        return "unknown"
+    # URL used as license (e.g. http://www.dnspython.org/LICENSE)
+    if s.startswith("http://") or s.startswith("https://"):
+        return "unknown"
+    # Vinay Sajip / "See LICENSE for license" (e.g. Python logging-related)
+    if "Vinay Sajip" in s and ("See LICENSE" in s or "All Rights Reserved" in s):
+        return "unknown"
+    # Multi-license description like "public domain, Python, 2-Clause BSD, GPL 3 (see COPYING.txt)"
+    if "public domain" in s_lower and (
+        "2-clause bsd" in s_lower or "gpl" in s_lower or "copying" in s_lower
+    ):
+        return "unknown"
+    # Normalize long license text (PyPI often returns full license body)
+    if len(s) > 200:
+        s_lower = s.lower()
+        # Apache License 2.0 (full or truncated text)
+        if "apache license" in s_lower and (
+            "version 2.0" in s_lower
+            or "www.apache.org" in s_lower
+            or "terms and conditions" in s_lower
+        ):
+            return "Apache-2.0"
+        # BSD 3-Clause / Modified BSD (Jupyter, IPython, terminado, etc.)
+        if (
+            "modified bsd" in s_lower
+            or "3-clause bsd" in s_lower
+            or "revised or 3-clause bsd" in s_lower
+            or "bsd 3-clause" in s_lower
+            or ("bsd license" in s_lower and "redistribution" in s_lower)
+            or ("licensing terms" in s_lower and "modified bsd" in s_lower)
+            or ("# licensing terms" in s_lower and "bsd" in s_lower)
+        ):
+            return "BSD-3-Clause"
+        # MIT (long form)
+        if "permission is hereby granted" in s_lower and (
+            "mit" in s_lower[:200] or "without restriction" in s_lower
+        ):
+            return "MIT"
+    # Shorter but still verbose BSD variants
+    if len(s) > 50:
+        s_lower = s.lower()
+        if "bsd 3-clause license" in s_lower and "redistribution" in s_lower:
+            return "BSD-3-Clause"
+        if "apache license" in s_lower and "version 2.0" in s_lower:
+            return "Apache-2.0"
+    # Long license text that is clearly MIT (original heuristic)
     if len(s) > 100 and "Permission is hereby granted" in s and "MIT" in s[:50]:
         return "MIT"
     return s
+
+
+def _expand_license_key(license_key: str) -> list[str]:
+    """
+    Return one or more normalized license keys. Only short SPDX-style compound
+    expressions (e.g. "(MIT OR GPL-3.0)" or "(Apache-2.0 OR BSD-3-Clause) AND PSF-2.0")
+    are expanded so the package appears under each constituent license. Long
+    license text is not split (it would create garbage keys from " AND " in prose).
+    """
+    raw = (license_key or "").strip()
+    if not raw:
+        return ["unknown"]
+    # Only expand short compound expressions; long text often contains " AND " / " OR " in prose
+    has_or_and = (
+        " OR " in raw or " AND " in raw or " or " in raw or " and " in raw
+    )
+    is_compound = (
+        len(raw) < 120
+        and has_or_and
+        and (
+            "(" in raw
+            or raw[0].isalnum()
+            or raw.startswith("Apache")
+            or raw.startswith("BSD")
+            or raw.startswith("MIT")
+            or raw.startswith("Universal")
+        )
+    )
+    if not is_compound:
+        return [normalize_license(raw)]
+    # Split by OR and AND (and lowercase variants), strip parens/whitespace, normalize
+    tokens: list[str] = [raw]
+    for sep in (" OR ", " AND ", " or ", " and "):
+        next_tokens: list[str] = []
+        for t in tokens:
+            next_tokens.extend(t.split(sep))
+        tokens = next_tokens
+    seen: set[str] = set()
+    result: list[str] = []
+    for t in tokens:
+        part = t.strip().strip("()").strip()
+        if not part or len(part) > 80:
+            continue
+        norm = normalize_license(part)
+        if norm and norm not in seen:
+            seen.add(norm)
+            result.append(norm)
+    return result if result else [normalize_license(raw)]
 
 
 _thread_local = threading.local()
@@ -668,6 +769,56 @@ def write_output(
                     w.writerow([repo_slug, license_key, pkg])
 
 
+def build_license_summary(results_dir: Path) -> dict[str, dict[str, list[str]]]:
+    """
+    Read all licenses_<repo>.json in results_dir and build a single summary:
+    license -> package -> list of repo_slugs where that package appears under that license.
+    Repo-specific result files are not modified or removed.
+    License keys are normalized so variants (e.g. Apache License 2.0 / Apache-2.0) merge.
+    """
+    summary: dict[str, dict[str, list[str]]] = {}
+    pattern = "licenses_*.json"
+    for path in results_dir.glob(pattern):
+        if path.name == "licenses_summary.json":
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if not isinstance(data, dict) or len(data) != 1:
+            continue
+        repo_slug, by_license = next(iter(data.items()))
+        if not isinstance(by_license, dict):
+            continue
+        for license_key, packages in by_license.items():
+            raw_key = (
+                license_key.strip() if isinstance(license_key, str) else str(license_key)
+            )
+            # Expand OR/AND so package appears under each license key, not under a combined key
+            norm_licenses = _expand_license_key(raw_key)
+            for pkg in packages if isinstance(packages, list) else []:
+                if not isinstance(pkg, str) or not pkg:
+                    continue
+                for norm_license in norm_licenses:
+                    if norm_license not in summary:
+                        summary[norm_license] = {}
+                    if pkg not in summary[norm_license]:
+                        summary[norm_license][pkg] = []
+                    if repo_slug not in summary[norm_license][pkg]:
+                        summary[norm_license][pkg].append(repo_slug)
+    for license_key in summary:
+        summary[license_key] = dict(sorted(summary[license_key].items()))
+    return dict(sorted(summary.items()))
+
+
+def write_summary_file(summary: dict[str, dict[str, list[str]]], output_dir: Path) -> Path:
+    """Write licenses_summary.json; create output_dir if needed. Returns path written."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / "licenses_summary.json"
+    out_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return out_path
+
+
 def process_repo(
     repo: str,
     output_dir: Path,
@@ -796,8 +947,27 @@ def main() -> int:
         action="store_true",
         help="Also write CSV files (default: JSON only)",
     )
+    parser.add_argument(
+        "--summary",
+        action="store_true",
+        help="After processing, combine all result files into licenses_summary.json (license -> package -> repos).",
+    )
+    parser.add_argument(
+        "--summary-only",
+        action="store_true",
+        help="Only build licenses_summary.json from existing files in --output-dir; do not process repos.",
+    )
     args = parser.parse_args()
     write_csv = args.csv
+    output_dir = args.output_dir
+    if args.summary_only:
+        if not output_dir.exists():
+            print(f"Error: output dir does not exist: {output_dir}", file=sys.stderr)
+            return 1
+        summary_data = build_license_summary(output_dir)
+        out_path = write_summary_file(summary_data, output_dir)
+        print(f"Wrote summary to {out_path}", file=sys.stderr)
+        return 0
     try:
         repos = _get_repo_list(args)
     except (ValueError, FileNotFoundError) as e:
@@ -805,7 +975,11 @@ def main() -> int:
         return 1
     try:
         if len(repos) == 1:
-            process_repo(repos[0], args.output_dir, not write_csv)
+            process_repo(repos[0], output_dir, not write_csv)
+            if args.summary:
+                summary_data = build_license_summary(output_dir)
+                out_path = write_summary_file(summary_data, output_dir)
+                print(f"Wrote summary to {out_path}", file=sys.stderr)
             return 0
         # Multi-repo: shared license cache, per-repo timing, summary table
         license_cache: dict[tuple[str, str, str | None], str] = {}
@@ -817,7 +991,7 @@ def main() -> int:
             repo_start = time.perf_counter()
             result, errors = process_repo(
                 repo,
-                args.output_dir,
+                output_dir,
                 not write_csv,
                 license_cache,
                 license_cache_lock,
@@ -827,6 +1001,10 @@ def main() -> int:
             summary.append((repo, status, duration_sec, len(errors), errors))
         total_duration = time.perf_counter() - total_start
         _print_summary_table(summary, total_duration)
+        if args.summary:
+            summary_data = build_license_summary(output_dir)
+            out_path = write_summary_file(summary_data, output_dir)
+            print(f"Wrote summary to {out_path}", file=sys.stderr)
         return 0
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
